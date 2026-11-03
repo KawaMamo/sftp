@@ -1,6 +1,13 @@
-# Sichere SFTP-Server-Einrichtung
+# Gehaertete SFTP-Server-Einrichtung
 
-Dieses Repository enthält eine leichtgewichtige, sichere SFTP-Server-Konfiguration auf Basis von Debian. Die Konfiguration nutzt eine erzwungene `chroot`-Isolierung (Benutzer werden in ihrem Home-Verzeichnis eingesperrt), deaktivierten Terminal-Zugriff für maximale Sicherheit und einen dedizierten Upload-Ordner für automatisierte Ingestion-Pipelines (wie BridgeLink / Mirth Connect).
+Dieses Repository enthaelt eine gehärtete, produktionsbereite SFTP-Server-Konfiguration auf Basis von Debian. Die Konfiguration verwendet reine **SSH-Public-Key-Authentifizierung** (Passwort-Anmeldung ist deaktiviert), eine erzwungene `chroot`-Isolierung, ein Skript fuer den Container-Start (`docker-entrypoint.sh`) sowie strikte Sicherheitsregeln.
+
+---
+
+## 🛠️ Dateien im Projekt
+
+1. `Dockerfile`: Baut das gehärtete Container-Image.
+2. `docker-entrypoint.sh`: Initialisiert beim Container-Start Laufzeit-Verzeichnisse und SSH-Host-Schluessel.
 
 ---
 
@@ -8,140 +15,226 @@ Dieses Repository enthält eine leichtgewichtige, sichere SFTP-Server-Konfigurat
 
 ```dockerfile
 FROM debian:stable-slim
-
+ENV DEBIAN_FRONTEND=noninteractive
 ```
+* **Basis-Image & Umgebung:** Verwendet Debian `stable-slim` und unterdrueckt interaktive Prompts waehrend der Paketinstallation.
 
-Basis-Image: Startet mit dem offiziellen, minimalen Debian stable-slim-Image, um den Container schlank und sicher zu halten.
-
-Dockerfile
+```dockerfile
 # Install OpenSSH server
-```
 RUN apt-get update && \
-    apt-get install -y openssh-server && \
-    rm -rf /var/lib/apt/lists/*
-
+    apt-get install -y --no-install-recommends openssh-server && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --system sftp_group && \
+    useradd --system \
+        --gid sftp_group \
+        --home-dir /home/sftpuser \
+        --shell /usr/sbin/nologin \
+        --no-create-home \
+        sftpuser
 ```
-OpenSSH-Installation: Aktualisiert die Paketlisten, installiert den OpenSSH-Server-Dienst (der SFTP-Übertragungen steuert) und löscht temporäre Paketdateien, um die Container-Größe zu minimieren.
+* **Installation & System-Benutzer:** Installiert OpenSSH ohne unnoetige Zusatzpakete. Erstellt die Gruppe `sftp_group` und den System-Benutzer `sftpuser` ohne Shell-Zugriff (`/usr/sbin/nologin`).
 
-Dockerfile
-# Create an sftp group and user (Username: sftpuser, Password: securepassword123)
-```
-RUN groupadd sftp_group && \
-    useradd -g sftp_group -m -s /bin/false sftpuser && \
-    echo "sftpuser:securepassword123" | chpasswd
-
-```
-Erstellung von Gruppe & Benutzer:
-
-groupadd: Erstellt eine eigene Gruppe sftp_group zur einfachen Rechteverwaltung.
-
-useradd: Erstellt den Benutzer sftpuser, weist ihn der Gruppe zu, legt automatisch ein Home-Verzeichnis an (-m) und setzt die Shell auf /bin/false, damit sich der Benutzer nicht in einem normalen Terminal anmelden kann.
-
-chpasswd: Setzt das Passwort für den Benutzer.
-
-Dockerfile
-# Set up secure chroot directory structure for sftpuser home
-```
+```dockerfile
+# Create chroot structure
 RUN mkdir -p /home/sftpuser/upload && \
     chown root:root /home/sftpuser && \
     chmod 755 /home/sftpuser && \
     chown sftpuser:sftp_group /home/sftpuser/upload && \
-    chmod 755 /home/sftpuser/upload
-
+    chmod 700 /home/sftpuser/upload
 ```
-Chroot-Berechtigungen:
+* **Verzeichnis-Berechtigungen:** 
+  * `/home/sftpuser`: Gehärtet für OpenSSH-Chroot (Besitzer `root:root`, Rechte `755`).
+  * `/home/sftpuser/upload`: Gehört `sftpuser` mit strikten Rechteeinstellungen (`700`), damit nur dieser Benutzer Zugriff hat.
 
-Das Haupt-Chroot-Verzeichnis (/home/sftpuser) muss zwingend im Besitz von root sein und darf nur von root beschrieben werden (Vorgabe von OpenSSH).
-
-Der innere Ordner upload gehört sftpuser, damit der Benutzer dort Dateien hochladen, lesen und löschen kann.
-
-Dockerfile
-# Configure OpenSSH chroot rules for the sftp_group
+```dockerfile
+# Configure SSH
+RUN printf '%s\n' \
+    'Port 22' \
+    'PermitRootLogin no' \
+    'PasswordAuthentication no' \
+    'KbdInteractiveAuthentication no' \
+    'PubkeyAuthentication yes' \
+    'PermitEmptyPasswords no' \
+    'MaxAuthTries 3' \
+    'LoginGraceTime 30' \
+    'X11Forwarding no' \
+    'AllowTcpForwarding no' \
+    'AllowAgentForwarding no' \
+    'AllowStreamLocalForwarding no' \
+    'PermitTunnel no' \
+    'PermitTTY no' \
+    'Subsystem sftp internal-sftp' \
+    '' \
+    'Match Group sftp_group' \
+    '    ChrootDirectory /home/%u' \
+    '    ForceCommand internal-sftp -d /upload' \
+    '    AllowTcpForwarding no' \
+    '    AllowAgentForwarding no' \
+    '    AllowStreamLocalForwarding no' \
+    '    X11Forwarding no' \
+    '    PermitTunnel no' \
+    '    PermitTTY no' \
+    > /etc/ssh/sshd_config
 ```
-RUN echo "\nMatch Group sftp_group\n    ChrootDirectory /home/%u\n    ForceCommand internal-sftp\n    X11Forwarding no\n    AllowTcpForwarding no" >> /etc/ssh/sshd_config
+* **SSH-Gehärtung:** Ueberschreibt die `sshd_config`. Passwort-Anmeldung wird vollstaendig deaktiviert, Public-Key-Authentifizierung erzwungen, Port-Forwarding unterbunden und `sftpuser` direkt im Unterordner `/upload` eingesperrt.
 
-```
+```dockerfile
+# Create directory for runtime SSH configuration
+RUN mkdir -p /run/sshd && \
+    chmod 755 /run/sshd
 
-SSH-Sicherheitsregeln: Fügt Regeln am Ende von /etc/ssh/sshd_config für Mitglieder der sftp_group hinzu. Sie werden in ihrem Home-Verzeichnis (/home/%u) eingesperrt, auf reine SFTP-Dateiübertragungen beschränkt und zusätzliche SSH-Funktionen werden deaktiviert.
+# Entrypoint
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/docker-entrypoint.sh
 
-Dockerfile
-# Expose SSH port
 EXPOSE 22
-
-# Start SSH server in the foreground
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 ```
-CMD ["/usr/sbin/sshd", "-D"]
+* **Laufzeit & Entrypoint:** Erstellt das erforderliche Laufzeitverzeichnis `/run/sshd`, kopiert das Start-Skript und setzt es als `ENTRYPOINT`.
+
+---
+
+## 📜 Skript-Erklaerung: `docker-entrypoint.sh`
+
+```sh
+#!/bin/sh
+set -eu
+
+# Ensure SSH runtime directory exists
+mkdir -p /run/sshd
+chmod 755 /run/sshd
+
+# Generate unique host keys if they do not exist
+ssh-keygen -A
+
+# Validate SSH configuration
+/usr/sbin/sshd -t
+
+# Start SSH server in foreground
+exec /usr/sbin/sshd -D -e
 ```
-Ausführung: Gibt Port 22 frei und startet den SSH-Dienst im Vordergrund (-D), damit der Docker-Container aktiv bleibt.
 
-🐳 Verwendung mit Docker
-1. Docker-Image bauen
-Speichere die Dockerfile in einem Ordner, öffne dort das Terminal und führe aus:
+### Warum benötigen wir dieses Skript?
+1. **Laufzeit vs. Build-Zeit:** SSH-Host-Schluessel (`ssh-keygen -A`) duerfen nicht fest im Image eingebaut werden, da sonst jeder Container dieselben privaten Schluessel nutzen wuerde. Das Skript generiert sie dynamisch beim ersten Start des Containers.
+2. **Konfigurationsprüfung:** `/usr/sbin/sshd -t` prüft die Syntax der SSH-Konfiguration vor dem Start.
+3. **Prozesssteuerung (`exec`):** Ersetzt den Shell-Prozess durch `sshd` (PID 1), sodass Log-Meldungen direkt an `docker logs` gesendet werden.
 
-Bash
+---
+
+## 🐳 Verwendung mit Docker
+
+### 1. SSH-Schluesselpaar auf dem Client erstellen
+Erstelle auf deinem Client-Rechner ein Schluesselpaar:
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/sftp_key -N ""
 ```
-docker build -t sftp-server .
+
+### 2. Image bauen
+```bash
+docker build -t hardened-sftp .
 ```
-2. Container starten
-Starte den Container und leite den lokalen Port 2222 auf Port 22 im Container um:
 
-Bash
+### 3. Container starten
+```bash
+docker run -d --name sftp_container -p 2222:22 hardened-sftp
 ```
-docker run -d --name sftp_container -p 2222:22 sftp-server
+
+### 4. Öffentlichen Schlüssel im Container hinterlegen
+Kopiere deinen öffentlichen Schlüssel (`~/.ssh/sftp_key.pub`) in den Container:
+```bash
+docker exec -it sftp_container mkdir -p /home/sftpuser/.ssh
+docker exec -it sftp_container chmod 700 /home/sftpuser/.ssh
+
+# Öffentlichen Schlüssel in authorized_keys eintragen:
+docker exec -it sftp_container sh -c "echo '$(cat ~/.ssh/sftp_key.pub)' > /home/sftpuser/.ssh/authorized_keys"
+
+# Rechte und Besitzer anpassen (Pflicht für OpenSSH):
+docker exec -it sftp_container chown -R sftpuser:sftp_group /home/sftpuser/.ssh
+docker exec -it sftp_container chmod 600 /home/sftpuser/.ssh/authorized_keys
 ```
-3. Verbinden
-Verbinde dich über einen SFTP-Client (z. B. FileZilla oder BridgeLink):
 
-Host: localhost (oder Server-IP)
-
-Port: 2222
-
-Benutzername: sftpuser
-
-Passwort: securepassword123
-
-Zielverzeichnis: /upload/
-
-🐧 Verwendung direkt auf einer Ubuntu Virtuellen Maschine (Ohne Docker)
-Falls du den SFTP-Server direkt auf einem Ubuntu-System ausführen möchtest, führe folgende Befehle nacheinander im Terminal aus:
-
-Schritt 1: OpenSSH-Server installieren
+### 5. Verbindung testen
+Standard SFTP-Verbindung via Konsole:
+```bash
+sftp -i ~/.ssh/sftp_key -P 2222 sftpuser@localhost
 ```
+
+---
+
+## 🐧 Verwendung direkt auf einer Ubuntu Virtuellen Maschine (Ohne Docker)
+
+Falls du dieselbe gehärtete Konfiguration direkt auf einer Ubuntu-VM einrichten moechtest:
+
+### Schritt 1: OpenSSH installieren & Gruppe/Benutzer anlegen
+```bash
 sudo apt-get update && sudo apt-get install -y openssh-server
-```
-Schritt 2: Gruppe, Benutzer und Ordnerstruktur anlegen
-```
-sudo groupadd sftp_group
-sudo useradd -g sftp_group -m -s /bin/false sftpuser
-echo "sftpuser:securepassword123" | sudo chpasswd
 
+sudo groupadd --system sftp_group
+sudo useradd --system \
+    --gid sftp_group \
+    --home-dir /home/sftpuser \
+    --shell /usr/sbin/nologin \
+    --no-create-home \
+    sftpuser
+```
+
+### Schritt 2: Verzeichnisse & Rechte einrichten
+```bash
 sudo mkdir -p /home/sftpuser/upload
 sudo chown root:root /home/sftpuser
 sudo chmod 755 /home/sftpuser
 sudo chown sftpuser:sftp_group /home/sftpuser/upload
-sudo chmod 755 /home/sftpuser/upload
-
+sudo chmod 700 /home/sftpuser/upload
 ```
-Schritt 3: OpenSSH konfigurieren
-Öffne die Konfigurationsdatei:
 
+### Schritt 3: Öffentlichen Schlüssel hinterlegen
+```bash
+sudo mkdir -p /home/sftpuser/.ssh
+sudo chmod 700 /home/sftpuser/.ssh
+
+# Füge deinen öffentlichen Schlüssel ein:
+echo "DEIN_PUBLIC_KEY_STRING" | sudo tee /home/sftpuser/.ssh/authorized_keys
+
+sudo chown -R sftpuser:sftp_group /home/sftpuser/.ssh
+sudo chmod 600 /home/sftpuser/.ssh/authorized_keys
 ```
+
+### Schritt 4: OpenSSH konfigurieren
+Öffne `/etc/ssh/sshd_config`:
+```bash
 sudo nano /etc/ssh/sshd_config
 ```
-Füge ganz unten in der Datei folgende Zeilen ein:
+Ersetze oder ergänze die Konfiguration durch die gehärteten Regeln:
+```text
+Port 22
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+AllowStreamLocalForwarding no
+PermitTunnel no
+PermitTTY no
+Subsystem sftp internal-sftp
 
-```
 Match Group sftp_group
     ChrootDirectory /home/%u
-    ForceCommand internal-sftp
-    X11Forwarding no
+    ForceCommand internal-sftp -d /upload
     AllowTcpForwarding no
-
+    AllowAgentForwarding no
+    AllowStreamLocalForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    PermitTTY no
 ```
-Speichere die Datei (Strg+O, Eingabe, dann Strg+X).
 
-Schritt 4: SSH-Dienst neu starten
-```
+### Schritt 5: Konfiguration testen & SSH neu starten
+```bash
+sudo sshd -t
 sudo systemctl restart ssh
 ```
-Der SFTP-Server ist nun direkt auf dem Standard-Port 22 deiner Ubuntu-VM erreichbar.
